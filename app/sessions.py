@@ -82,6 +82,22 @@ lets the drill continue from the new version. The flag is persisted in its own
 column; databases created before the column existed are upgraded at startup by
 adding it with a default of unlocked, leaving every stored protocol, trace and
 version untouched.
+
+Up to eight committed sessions can also be packed into one self-contained
+JSON package and recreated on a service that does not share their database.
+Export is a read-only, version-pinned bulk read inside one transaction: every
+named id must exist (otherwise 404) at its named ``expected_version``
+(otherwise 409 with the id and current version), and all packed sessions come
+from the same committed snapshot in the request's input order; source rows are
+never modified. Import never consults any source database — the package is
+its only input. Other package format versions and duplicate source ids are
+rejected (422); every entry's trace ids are replayed from its protocol's
+initial configuration under the ordinary one-slot queue rules, and no step may
+follow a completed configuration. A replay failure names the 1-based entry and
+the 1-based failed step. Only when every entry validates do all sessions get
+new ids, start at version 0 (keeping the locked flag) and persist inside one
+transaction with fully recomputed snapshots; a rejected package creates no
+session and never overwrites an existing one.
 """
 
 import json
@@ -889,6 +905,167 @@ def _comparison_conflict(current_version: int, side: str,
             "session_id": session_id,
         },
     )
+
+
+# ---------------------------------------------------------------------------
+# Cross-database package export / import
+# ---------------------------------------------------------------------------
+
+
+PACKAGE_SCHEMA_VERSION = 1
+
+
+def export_sessions(items) -> dict:
+    """Pack 1～8 committed drill sessions into one self-contained package.
+
+    ``items`` is the validated request list of ``(session_id,
+    expected_version)`` pairs, pairwise distinct and in the caller's input
+    order. Every row is read inside one deferred (read-only) transaction, so in
+    WAL mode all packed sessions belong to the same committed snapshot: the
+    answer is either the whole package at the named versions or an error. An
+    unknown session answers 404 (checked first, in input order); a stale
+    expected version answers 409 carrying the offending session id and its
+    current version. Export never writes anything and consumes no version.
+    """
+    connection = _connect()
+    try:
+        # The first read establishes one shared snapshot for every SELECT.
+        connection.execute("BEGIN")
+        rows = {}
+        for item in items:
+            row = connection.execute(
+                "SELECT version, protocol, trace_ids, locked FROM sessions WHERE id = ?",
+                (item.session_id,),
+            ).fetchone()
+            if row is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail={"error": "unknown_session", "session_id": item.session_id},
+                )
+            rows[item.session_id] = row
+
+        packed = []
+        for item in items:
+            version, protocol_text, trace_text, locked = rows[item.session_id]
+            if version != item.expected_version:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "error": "version_conflict",
+                        "current_version": version,
+                        "session_id": item.session_id,
+                    },
+                )
+            packed.append(
+                {
+                    "source_id": item.session_id,
+                    "source_version": version,
+                    "protocol": DeadlockRequest.model_validate(
+                        json.loads(protocol_text)
+                    ),
+                    "trace_ids": json.loads(trace_text),
+                    "locked": bool(locked),
+                }
+            )
+        return {"schema_version": PACKAGE_SCHEMA_VERSION, "sessions": packed}
+    except BaseException:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def _replay_import_entry(entry, entry_index: int) -> None:
+    """Replay one package entry from its protocol's initial configuration.
+
+    The ordinary validation (unique transition ids, state references, message
+    limits, ...) already ran while parsing the package. The trace ids are then
+    replayed under the one-slot queue rules: each step must exist and be
+    enabled at the current configuration, and a completed configuration may
+    not precede the last step (there must be no further step after it). Any
+    failure is a 422 naming the 1-based package entry and the 1-based failed
+    step. Nothing is written by this check.
+    """
+    model = build_model(entry.protocol)
+    by_id = {transition.id: transition for transition in model.transitions}
+
+    configuration = model.initial
+    for step, transition_id in enumerate(entry.trace_ids, start=1):
+        if is_completion(configuration, model.finals):
+            raise _import_replay_failure(
+                entry_index, step, "configuration already completed"
+            )
+        transition = by_id.get(transition_id)
+        if transition is None:
+            raise _import_replay_failure(
+                entry_index, step, f"unknown transition id {transition_id!r}"
+            )
+        if transition not in enabled_transitions(configuration, model.outgoing):
+            raise _import_replay_failure(
+                entry_index, step, f"transition {transition_id!r} is not enabled"
+            )
+        configuration = apply_transition(configuration, transition)
+
+
+def _import_replay_failure(entry_index: int, failed_step: int, reason: str) -> HTTPException:
+    return HTTPException(
+        status_code=422,
+        detail={
+            "error": "replay_failed",
+            "entry": entry_index,
+            "failed_step": failed_step,
+            "reason": reason,
+        },
+    )
+
+
+def import_sessions(package) -> dict:
+    """Recreate every package session with new ids on this database.
+
+    The package is self-contained: no source database is consulted. Every
+    entry is replayed and validated before any write, so an illegal entry
+    rejects the whole package and leaves no partial sessions. Once all entries
+    pass, they are inserted together inside one ``BEGIN IMMEDIATE``
+    transaction: each gets a fresh id, starts at version 0, keeps its locked
+    flag and receives a fully recomputed snapshot in package order. Fresh
+    random ids mean an import never overwrites an existing session.
+    """
+    # Validate (including replay) purely from the package before touching the
+    # database, so a rejected import provably creates nothing.
+    validated = []
+    for entry_index, entry in enumerate(package.sessions, start=1):
+        _replay_import_entry(entry, entry_index)
+        validated.append(entry)
+
+    connection = _connect()
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        imported = []
+        for entry in validated:
+            new_id = uuid4().hex
+            connection.execute(
+                "INSERT INTO sessions (id, version, protocol, trace_ids, locked)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (
+                    new_id,
+                    0,
+                    _dump_protocol(entry.protocol),
+                    json.dumps(entry.trace_ids),
+                    int(entry.locked),
+                ),
+            )
+            view = _session_view(
+                new_id, 0, entry.protocol, entry.trace_ids, entry.locked
+            )
+            imported.append({"source_id": entry.source_id, **view})
+        connection.commit()
+        return {"schema_version": PACKAGE_SCHEMA_VERSION, "imported": imported}
+    except BaseException:
+        # No-op when the commit already succeeded.
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
 
 
 def _update_session(session_id: str, mutate) -> dict:

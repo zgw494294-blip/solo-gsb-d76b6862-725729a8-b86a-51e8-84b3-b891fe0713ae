@@ -452,3 +452,100 @@ class SessionComparisonResponse(BaseModel):
     right_version: int
     A_to_B: DirectionComparison
     B_to_A: DirectionComparison
+
+
+# ---------------------------------------------------------------------------
+# Cross-database session package export / import
+# ---------------------------------------------------------------------------
+
+
+class SessionExportItem(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    # One drill session to pack, pinned to the named committed version. The
+    # export endpoint accepts 1～8 items with pairwise distinct ids.
+    session_id: NonEmptyId
+    expected_version: Annotated[int, Field(ge=0)]
+
+
+class SessionExportRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    sessions: Annotated[list[SessionExportItem], Field(min_length=1, max_length=8)]
+
+    @model_validator(mode="after")
+    def validate_unique_session_ids(self) -> Self:
+        ids = [item.session_id for item in self.sessions]
+        if len(set(ids)) != len(ids):
+            raise ValueError("session ids must not be duplicated in one export")
+        return self
+
+
+class ExportedSession(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    # One packed drill session: its original id/version, the full protocol,
+    # the executed trace ids and the read-only-baseline flag.
+    source_id: str
+    source_version: int
+    protocol: DeadlockRequest
+    trace_ids: list[str]
+    locked: bool
+
+
+class SessionExportResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # Package format version. Only version 1 is produced and accepted.
+    schema_version: Literal[1]
+    # Sessions appear in exactly the request's input order.
+    sessions: list[ExportedSession]
+
+
+def _validate_schema_version(value: Any, handler: Any) -> Any:
+    # ``True`` equals 1 in Python but is not the package format version.
+    if isinstance(value, bool) or value != 1:
+        raise ValueError("unsupported schema_version: only version 1 is accepted")
+    return handler(value)
+
+
+class ImportedSession(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    # One entry of an export package replayed on an unrelated database.
+    source_id: NonEmptyId
+    source_version: Annotated[int, Field(ge=0)]
+    protocol: DeadlockRequest
+    trace_ids: list[NonEmptyId] = Field(default_factory=list)
+    locked: StrictBool = False
+
+
+class SessionImportRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    # Any other format version is rejected outright; the import never consults
+    # the source database, only this self-contained package.
+    schema_version: Annotated[Literal[1], WrapValidator(_validate_schema_version)]
+    sessions: Annotated[list[ImportedSession], Field(min_length=1, max_length=8)]
+
+    @model_validator(mode="after")
+    def validate_unique_source_ids(self) -> Self:
+        ids = [item.source_id for item in self.sessions]
+        if len(set(ids)) != len(ids):
+            raise ValueError("source_id values must not be duplicated in one package")
+        return self
+
+
+class ImportedSessionView(SessionView):
+    # A freshly imported session is an ordinary session view, additionally
+    # naming the source id it was recreated from (the new id is ``id``).
+    source_id: str
+
+
+class SessionImportResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal[1]
+    # Old-to-new id mapping plus the fully recomputed snapshot, in the same
+    # order as the package's ``sessions`` list.
+    imported: list[ImportedSessionView]

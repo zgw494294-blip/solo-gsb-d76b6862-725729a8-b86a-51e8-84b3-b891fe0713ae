@@ -574,7 +574,7 @@ curl -X POST http://localhost:8000/v1/deactivation-plans \
 
 ## 双端协议演练会话
 
-除上述四个离线分析接口外，服务还提供**有状态演练会话**：创建会话后可以逐个执行转移、随时查询当前配置与完整执行轨迹，也可以修改协议后从新初态重放已执行步骤，继续演练；还可以从指定轨迹位置另开**分支会话**，两边独立续演；另一会话中已走通的后续轨迹也可以直接**接回**目标会话，免去逐步重演。两次演练还可以按方向**对比消息交换**：只比较各自 `(action, message)` 序列，忽略转移 ID、端点状态与两方向之间的交错。还可以沿一次演练的完整轨迹**逐条追踪每个消息的发送与接收**：每次发送单列一条记录并与同方向后续的接收按一格队列先后配对，尚未被接收的发送三项接收信息为 `null`。会话还可以被**锁定为只读基准**：锁定后执行、替换协议与作为接回目标均被拒绝，查询、对比、分支与作为接回来源不受影响，解锁后按新版本继续演练。
+除上述四个离线分析接口外，服务还提供**有状态演练会话**：创建会话后可以逐个执行转移、随时查询当前配置与完整执行轨迹，也可以修改协议后从新初态重放已执行步骤，继续演练；还可以从指定轨迹位置另开**分支会话**，两边独立续演；另一会话中已走通的后续轨迹也可以直接**接回**目标会话，免去逐步重演。两次演练还可以按方向**对比消息交换**：只比较各自 `(action, message)` 序列，忽略转移 ID、端点状态与两方向之间的交错。还可以沿一次演练的完整轨迹**逐条追踪每个消息的发送与接收**：每次发送单列一条记录并与同方向后续的接收按一格队列先后配对，尚未被接收的发送三项接收信息为 `null`。会话还可以被**锁定为只读基准**：锁定后执行、替换协议与作为接回目标均被拒绝，查询、对比、分支与作为接回来源不受影响，解锁后按新版本继续演练。最后，1～8 个会话可以**导出为自包含 JSON 资料包**（`schema_version=1`，按输入顺序携带协议、轨迹 ID 与锁定标记，只读且不依赖源库之外的任何东西），交给**另一个实例/另一份数据库导入续演**：导入端拒绝其他格式版本与重复 `source_id`，从各协议初态按一格队列规则重放每条轨迹（完成后不得有后续步），整包合格才一起创建版本 0 的新会话并完整重算快照，任一条失败则整包拒绝、不留部分会话。
 
 - 会话（协议、轨迹 ID、版本、锁定标记）持久化在**本地 SQLite 数据库**中，所有进程共享同一文件：服务或容器重建后仍可按原会话 ID 查询并继续执行、替换协议，版本不会回退。
 - 服务默认以 **2 个 Uvicorn worker** 进程运行，启动时自动建库建表（无需迁移旧数据）；旧版数据库启动时自动补充锁定列，已有协议、轨迹与版本保持不变，旧会话默认未锁定。
@@ -596,6 +596,8 @@ curl -X POST http://localhost:8000/v1/deactivation-plans \
 | `POST` | `/v1/session-comparisons` | 按消息方向对比两次演练（只读、不改数据与版本），请求体 `{"left_session_id": ..., "right_session_id": ..., "left_expected_version": ..., "right_expected_version": ...}` |
 | `POST` | `/v1/sessions/{id}/message-tracks` | 沿轨迹逐条追踪消息发送/接收（只读），请求体 `{"expected_version": ...}` |
 | `POST` | `/v1/sessions/{id}/transition-feasibility` | 查询当前配置下全部转移的可执行性与**所有**阻塞原因（只读），请求体 `{"expected_version": ...}` |
+| `POST` | `/v1/session-exports` | 导出 1～8 个同快照会话为 JSON 资料包（只读），请求体 `{"sessions": [{"session_id", "expected_version"}]}` |
+| `POST` | `/v1/session-imports` | 在不依赖源库的实例上导入资料包：整包重放校验后创建版本 0 的新会话，成功 `201` |
 
 响应均为同一会话视图：
 
@@ -1499,6 +1501,218 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST \
 
 替换协议后查询按**新定义**重放（例如把 `s1` 的消息由 `"m"` 改为 `"ZZ"`，再按新版本查询即得到 `actual: "ZZ"` 的消息不匹配与队列占用）；查询不写数据、不消耗版本。并发场景下（2 个 worker），查询与执行/替换协议同时进行时，每个查询要么返回指定版本的完整结果，要么返回 `409`，不会出现跨版本拼凑的原因列表。
 
+### 演练会话 JSON 资料包：导出与异库导入续演
+
+可以把 **1～8 个**演练会话打包成一份自包含 JSON 资料包，交给**另一个实例**（另一份数据库、另一个容器或另一台机器）导入续演。资料包只携带协议、轨迹 ID 与锁定标记，导入端**完全不依赖源库**。
+
+#### 导出：`POST /v1/session-exports`（只读）
+
+请求体按顺序给出 1～8 组会话 ID 与期望版本：
+
+```json
+{ "sessions": [ { "session_id": "...", "expected_version": 0 } ] }
+```
+
+- 同一次请求中的会话 **ID 不得重复**；条目数为 0 或超过 8 均返回 `422`。
+- 全部会话必须来自**同一份已提交快照**：所有行在同一个读事务内读取。未知会话返回 `404`（按输入顺序判定，先于版本过期），响应体指出该 ID：
+
+```json
+{ "detail": { "error": "unknown_session", "session_id": "nope" } }
+```
+
+- `expected_version` 与当前版本不一致返回 `409`，指出 ID 与 `current_version`（多个过期时按输入顺序报第一个）：
+
+```json
+{ "detail": { "error": "version_conflict", "current_version": 3, "session_id": "…" } }
+```
+
+- 导出**不修改源数据、不消耗版本**；锁定会话同样可以导出。
+
+成功 `200`，资料包格式：
+
+```json
+{
+  "schema_version": 1,
+  "sessions": [
+    {
+      "source_id": "源会话 ID",
+      "source_version": 2,
+      "protocol": { "完整协议，字段与创建请求一致": "…" },
+      "trace_ids": ["t1", "t4"],
+      "locked": false
+    }
+  ]
+}
+```
+
+`sessions` 严格**按输入顺序**排列；`source_id` / `source_version` 是导出时的源 ID 与版本，`trace_ids` 是已执行轨迹，`locked` 保留只读基准标记。
+
+#### 导入：`POST /v1/session-imports`
+
+把资料包原样 POST 到另一个实例即可。导入端不访问源库：
+
+- 只接受 `schema_version: 1`，其他格式版本（含缺失、字符串、布尔）返回 `422`；
+- 包内 `source_id` 不得重复；条目数 1～8；协议复用创建会话的全部校验；非法包整体 `422`；
+- 对每个条目，服务按**现有校验和一格队列规则**从协议初态**重放** `trace_ids`：每一步的转移 ID 必须存在且当前可执行，且**完成后不得再有后续步**（轨迹未走完就到达完成配置同样拒绝）；
+- 重放失败返回 `422`，标出**从 1 计**的条目 `entry` 与该条目内**从 1 计**的失败步 `failed_step`：
+
+```json
+{ "detail": { "error": "replay_failed", "entry": 2, "failed_step": 3, "reason": "transition 't4' is not enabled" } }
+```
+
+- **全部条目合格才一起持久化**：每个会话获得**全新 ID**、版本从 **0** 开始、**保留 `locked`**、快照（当前配置、完整轨迹、可执行 ID）按重放**完整重算**；任一一条失败则**整包拒绝**，不留部分会话；新 ID 随机生成，因此**不会覆盖**库中任何旧会话，源 ID 已存在于目标库也不影响导入。
+
+成功 `201`，按资料包顺序返回**旧→新 ID 映射与完整快照**：
+
+```json
+{
+  "schema_version": 1,
+  "imported": [
+    {
+      "source_id": "源会话 ID",
+      "id": "新会话 ID",
+      "version": 0,
+      "locked": false,
+      "protocol": { "…": "…" },
+      "configuration": { "…": "…" },
+      "trace": [ { "index": 1, "…": "…" } ],
+      "enabled_transition_ids": [ "…" ]
+    }
+  ]
+}
+```
+
+#### 可执行示例：导出 → 异库实例导入续演（端口 8000 / 8001）
+
+下面在同一台机器上启动**两份独立数据库**的实例模拟两个环境（Compose 部署时就是两个互不共享卷的环境）。生产 Compose 服务始终监听 **8000 端口**，8001 仅为本示例的第二个实例：
+
+```bash
+# 实例 A（源库，端口 8000）与实例 B（另一份空库，端口 8001）
+SESSIONS_DB=/tmp/dbA/sessions.db python3 -m uvicorn app.main:app \
+  --host 127.0.0.1 --port 8000 --workers 2 &
+mkdir -p /tmp/dbB
+SESSIONS_DB=/tmp/dbB/sessions.db python3 -m uvicorn app.main:app \
+  --host 127.0.0.1 --port 8001 --workers 2 &
+
+PROTO='{
+  "A": { "states": [0, 1], "initial": 0, "finals": [1] },
+  "B": { "states": [0, 1], "initial": 0, "finals": [1] },
+  "transitions": [
+    { "id": "t1", "from": "A", "to": "B", "action": "send",    "message": "m", "source": 0, "target": 1 },
+    { "id": "t4", "from": "A", "to": "B", "action": "receive", "message": "m", "source": 0, "target": 1 }
+  ]
+}'
+
+# 源实例：创建两个会话，第一个执行 t1（version 1），第二个为空轨迹（version 0）
+S1=$(curl -s -X POST http://localhost:8000/v1/sessions -H 'Content-Type: application/json' -d "$PROTO" \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+curl -s -o /dev/null -X POST http://localhost:8000/v1/sessions/$S1/transitions \
+  -H 'Content-Type: application/json' -d '{"transition_id":"t1","expected_version":0}'
+S2=$(curl -s -X POST http://localhost:8000/v1/sessions -H 'Content-Type: application/json' -d "$PROTO" \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+
+# 导出资料包（两组会话，按输入顺序，schema_version=1）
+curl -s -X POST http://localhost:8000/v1/session-exports \
+  -H 'Content-Type: application/json' \
+  -d "{\"sessions\":[{\"session_id\":\"$S1\",\"expected_version\":1},{\"session_id\":\"$S2\",\"expected_version\":0}]}" \
+  -o /tmp/package.json
+python3 -m json.tool /tmp/package.json
+```
+
+把 `/tmp/package.json` 交给另一个实例（可拷贝文件或通过任意通道传输），导入并续演：
+
+```bash
+# 在另一份数据库（端口 8001，完全不知道 S1/S2）导入
+curl -s -X POST http://localhost:8001/v1/session-imports \
+  -H 'Content-Type: application/json' --data @/tmp/package.json -o /tmp/imported.json
+python3 -m json.tool /tmp/imported.json
+
+# 按顺序得到旧->新 ID 映射；新会话版本 0、轨迹按新库重算
+N1=$(python3 -c 'import json;print(json.load(open("/tmp/imported.json"))["imported"][0]["id"])')
+# 导入的会话与普通会话无异：从版本 0 继续执行 t4 至完成
+curl -s -X POST http://localhost:8001/v1/sessions/$N1/transitions \
+  -H 'Content-Type: application/json' -d '{"transition_id":"t4","expected_version":0}'
+
+# 源实例的会话保持原样；源 ID 在新实例、新 ID 在源实例都互不存在
+curl -s -o /dev/null -w '%{http_code}\n' http://localhost:8000/v1/sessions/$N1   # 404（新 ID 不在源库）
+curl -s http://localhost:8000/v1/sessions/$S1   # 仍是 version 1、轨迹 [t1]
+```
+
+导入响应的第一个条目示例（`source_id` 为源 ID，`id` 为新 ID，版本重置为 0，配置由 `t1` 重算：A→B 格中为 `"m"`、可执行为 `["t4"]`）：
+
+```json
+{
+  "schema_version": 1,
+  "imported": [
+    {
+      "source_id": "…S1…",
+      "id": "…新 ID…",
+      "version": 0,
+      "locked": false,
+      "configuration": { "state": { "A": 1, "B": 0 }, "queues": { "A_to_B": "m", "B_to_A": null } },
+      "trace": [ { "index": 1, "transition_id": "t1", "…": "…" } ],
+      "enabled_transition_ids": ["t4"]
+    }
+  ]
+}
+```
+
+`locked: true` 的会话导入后**仍为锁定**：在新实例上执行转移返回 `409`，需先用新版本（导入后为版本 0）解锁再续演。同一资料包可重复导入，每次都生成互不相同的新 ID、互不覆盖。
+
+#### 可执行示例：整包拒绝（404 / 409 / 422）
+
+```bash
+# 导出侧：未知 ID -> 404（即使同批另一条版本过期，也先报未知）
+curl -s -i -X POST http://localhost:8000/v1/session-exports \
+  -H 'Content-Type: application/json' \
+  -d '{"sessions":[{"session_id":"nope","expected_version":0}]}'
+# HTTP/1.1 404 Not Found
+# {"detail":{"error":"unknown_session","session_id":"nope"}}
+
+# 导出侧：期望版本过期 -> 409 并指出 ID 与 current_version
+curl -s -i -X POST http://localhost:8000/v1/session-exports \
+  -H 'Content-Type: application/json' \
+  -d "{\"sessions\":[{\"session_id\":\"$S1\",\"expected_version\":0}]}"
+# HTTP/1.1 409 Conflict
+# {"detail":{"error":"version_conflict","current_version":1,"session_id":"…"}}
+
+# 导出侧：同批 ID 重复 / 0 或 9 条 -> 422
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8000/v1/session-exports \
+  -H 'Content-Type: application/json' \
+  -d "{\"sessions\":[{\"session_id\":\"$S2\",\"expected_version\":0},{\"session_id\":\"$S2\",\"expected_version\":0}]}"
+# 422
+```
+
+```bash
+# 导入侧：其他格式版本 -> 422
+python3 -c 'import json;p=json.load(open("/tmp/package.json"));p["schema_version"]=2;json.dump(p,open("/tmp/p_v2.json","w"))'
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8001/v1/session-imports \
+  -H 'Content-Type: application/json' --data @/tmp/p_v2.json
+# 422
+
+# 导入侧：包内 source_id 重复 -> 422
+python3 -c 'import json;p=json.load(open("/tmp/package.json"));p["sessions"][1]["source_id"]=p["sessions"][0]["source_id"];json.dump(p,open("/tmp/p_dup.json","w"))'
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8001/v1/session-imports \
+  -H 'Content-Type: application/json' --data @/tmp/p_dup.json
+# 422
+
+# 导入侧：重放失败 -> 422，标出从 1 计的条目与失败步
+# （把第 1 条协议中 t4 的消息改成 "ZZ"，其轨迹 [t1,t4] 在第 2 步无法重放）
+python3 - <<'PY'
+import json
+p = json.load(open("/tmp/package.json"))
+p["sessions"][0]["trace_ids"] = ["t1", "t4"]
+p["sessions"][0]["protocol"]["transitions"][1]["message"] = "ZZ"
+json.dump(p, open("/tmp/p_bad.json", "w"))
+PY
+curl -s -i -X POST http://localhost:8001/v1/session-imports \
+  -H 'Content-Type: application/json' --data @/tmp/p_bad.json
+# HTTP/1.1 422 Unprocessable Entity
+# {"detail":{"error":"replay_failed","entry":1,"failed_step":2,"reason":"transition 't4' is not enabled"}}
+```
+
+整包拒绝时**不留下任何部分会话**：可用 `GET /v1/sessions/{新ID}`（404）或直接检查数据库行数复核，已存在的旧会话也不受影响。
+
 ### 存储位置与卷保留规则
 
 - 数据库文件：容器内 **`/data/sessions.db`**（WAL 模式，运行时可能伴随 `-wal` / `-shm` 文件），可用环境变量 `SESSIONS_DB` 覆盖；本地开发缺省为工作目录下的 `./sessions.db`。
@@ -1586,6 +1800,7 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ├── test_comparison.py
 ├── test_lock.py
 ├── test_message_tracks.py
+├── test_session_packages.py
 ├── test_sessions.py
 └── test_transition_feasibility.py
 ```
