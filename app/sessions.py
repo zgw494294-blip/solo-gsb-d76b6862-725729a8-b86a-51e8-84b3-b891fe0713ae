@@ -82,6 +82,21 @@ lets the drill continue from the new version. The flag is persisted in its own
 column; databases created before the column existed are upgraded at startup by
 adding it with a default of unlocked, leaving every stored protocol, trace and
 version untouched.
+
+One to eight sessions can be exported together as a JSON bundle carrying each
+session's id, version, protocol, trace ids and lock flag in the request's
+order. Every named row is read inside one deferred transaction, so the whole
+bundle comes from the same committed snapshot: a stale expected version
+answers 409 naming the session and its current version, an unknown id answers
+404, and the export never writes anything. The bundle is self-contained, so
+another instance can import it without any access to the source database: the
+format version must be 1, source ids must not repeat, and every trace is
+replayed from its protocol's initial configuration under the one-slot queue
+rules (a trace that reaches completion before its last step is rejected).
+Only when every entry validates are the new sessions inserted — together, in
+one ``BEGIN IMMEDIATE`` transaction, with fresh ids, version 0 and the lock
+flag preserved — so a failed import leaves no partial sessions behind and
+existing sessions are never overwritten.
 """
 
 import json
@@ -253,19 +268,9 @@ def replace_protocol(session_id: str, protocol, expected_version: int) -> dict:
         # Replay the already executed ids from the new initial configuration.
         # Every step must be enabled and the trace must not reach a completion
         # configuration before its last step; otherwise the old session stands.
-        model = build_model(protocol)
-        by_id = {transition.id: transition for transition in model.transitions}
-
-        configuration = model.initial
-        for index, transition_id in enumerate(trace_ids, start=1):
-            if is_completion(configuration, model.finals):
-                raise _replay_failure(index, "configuration already completed")
-            transition = by_id.get(transition_id)
-            if transition is None:
-                raise _replay_failure(index, f"unknown transition id {transition_id!r}")
-            if transition not in enabled_transitions(configuration, model.outgoing):
-                raise _replay_failure(index, f"transition {transition_id!r} is not enabled")
-            configuration = apply_transition(configuration, transition)
+        failure = _replay_failure_at(protocol, trace_ids)
+        if failure is not None:
+            raise _replay_failure(*failure)
 
         return version + 1, protocol, trace_ids, locked
 
@@ -878,6 +883,130 @@ def _feasibility_view(protocol, trace_ids: list[str]) -> list[dict]:
     return entries
 
 
+def export_sessions(items) -> dict:
+    """Export one to eight sessions as a self-contained JSON bundle.
+
+    Every named row is read inside one deferred (read-only) transaction, so in
+    WAL mode all entries come from the same committed snapshot: the bundle is
+    either the complete export at the named versions or a 409 naming the first
+    stale session and its current version, never a cross-revision mix. An
+    unknown session answers 404. The export writes nothing and consumes no
+    version; the stored protocol text is canonical JSON of the validated
+    protocol, so the bundle carries the source data unchanged.
+    """
+    connection = _connect()
+    try:
+        connection.execute("BEGIN")
+        exported = []
+        for item in items:
+            row = connection.execute(
+                "SELECT version, protocol, trace_ids, locked FROM sessions WHERE id = ?",
+                (item.session_id,),
+            ).fetchone()
+            if row is None:
+                raise HTTPException(status_code=404, detail="unknown session")
+            version, protocol_text, trace_text, locked = row
+            if version != item.expected_version:
+                raise _version_conflict(version, session_id=item.session_id)
+            exported.append(
+                {
+                    "source_id": item.session_id,
+                    "source_version": version,
+                    "protocol": json.loads(protocol_text),
+                    "trace_ids": json.loads(trace_text),
+                    "locked": bool(locked),
+                }
+            )
+        return {"schema_version": 1, "sessions": exported}
+    except BaseException:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def import_sessions(bundle) -> dict:
+    """Import a session bundle, creating one new session per entry.
+
+    The bundle is self-contained, so the import never touches the source
+    database: only format version 1 is accepted, duplicate source ids are
+    rejected by the request schema, and every entry's trace is replayed from
+    its protocol's initial configuration under the one-slot queue rules — a
+    step that is not enabled, an unknown transition id, or a completion
+    configuration reached before the trace's last step rejects the whole
+    bundle with a 422 naming the entry (counted from 1) and the failed step.
+
+    Only when every entry validates are the sessions created: all rows are
+    inserted together inside one ``BEGIN IMMEDIATE`` transaction, each with a
+    fresh id, version 0 and the bundle's lock flag, so a failure leaves no
+    partial sessions behind and existing sessions are never overwritten. The
+    response echoes the old-to-new id mapping and each new session's
+    recomputed snapshot in the bundle's input order.
+    """
+    if bundle.schema_version != 1:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "unsupported_schema_version",
+                "schema_version": bundle.schema_version,
+            },
+        )
+
+    # Validate every entry before any write; the first failing entry rejects
+    # the whole bundle.
+    for entry_index, entry in enumerate(bundle.sessions, start=1):
+        failure = _replay_failure_at(entry.protocol, entry.trace_ids)
+        if failure is not None:
+            step, reason = failure
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "replay_failed",
+                    "entry_index": entry_index,
+                    "first_failed_step": step,
+                    "reason": reason,
+                },
+            )
+
+    connection = _connect()
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        created = []
+        for entry in bundle.sessions:
+            session_id = uuid4().hex
+            connection.execute(
+                "INSERT INTO sessions (id, version, protocol, trace_ids, locked)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (
+                    session_id,
+                    0,
+                    _dump_protocol(entry.protocol),
+                    json.dumps(entry.trace_ids),
+                    int(entry.locked),
+                ),
+            )
+            created.append((entry, session_id))
+        connection.commit()
+    except BaseException:
+        # No-op when the commit already succeeded.
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+    return {
+        "sessions": [
+            {
+                "source_id": entry.source_id,
+                "session": _session_view(
+                    session_id, 0, entry.protocol, entry.trace_ids, entry.locked
+                ),
+            }
+            for entry, session_id in created
+        ]
+    }
+
+
 def _comparison_conflict(current_version: int, side: str,
                          session_id: str) -> HTTPException:
     return HTTPException(
@@ -950,9 +1079,11 @@ def _dump_protocol(protocol) -> str:
 def _version_conflict(current_version: int, session: str | None = None,
                       session_id: str | None = None) -> HTTPException:
     detail = {"error": "version_conflict", "current_version": current_version}
-    # Adoptions verify two sessions; the extra fields name the stale one.
+    # Adoptions verify two sessions; the extra fields name the stale one. The
+    # bundle export names only the stale entry's session id.
     if session is not None:
         detail["session"] = session
+    if session_id is not None:
         detail["session_id"] = session_id
     return HTTPException(status_code=409, detail=detail)
 
@@ -974,6 +1105,30 @@ def _replay_failure(index: int, reason: str) -> HTTPException:
             "reason": reason,
         },
     )
+
+
+def _replay_failure_at(protocol, trace_ids: list[str]) -> tuple[int, str] | None:
+    """First step (counted from 1) where the trace fails to replay, and why.
+
+    The trace is replayed from the protocol's initial configuration under the
+    one-slot queue rules: every id must exist in the protocol, every step must
+    be enabled, and no completion configuration may be reached before the
+    trace's last step. Returns ``None`` when the whole trace replays cleanly.
+    """
+    model = build_model(protocol)
+    by_id = {transition.id: transition for transition in model.transitions}
+
+    configuration = model.initial
+    for index, transition_id in enumerate(trace_ids, start=1):
+        if is_completion(configuration, model.finals):
+            return index, "configuration already completed"
+        transition = by_id.get(transition_id)
+        if transition is None:
+            return index, f"unknown transition id {transition_id!r}"
+        if transition not in enabled_transitions(configuration, model.outgoing):
+            return index, f"transition {transition_id!r} is not enabled"
+        configuration = apply_transition(configuration, transition)
+    return None
 
 
 def _replay(model, trace_ids: list[str]):

@@ -1,6 +1,14 @@
 from typing import Annotated, Any, Literal, Union
 
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, WrapValidator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictInt,
+    WrapValidator,
+    model_validator,
+)
 from typing_extensions import Self
 
 
@@ -452,3 +460,80 @@ class SessionComparisonResponse(BaseModel):
     right_version: int
     A_to_B: DirectionComparison
     B_to_A: DirectionComparison
+
+
+# ---------------------------------------------------------------------------
+# Session bundle export / import
+# ---------------------------------------------------------------------------
+
+
+class SessionExportItem(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    # One session to include in the exported bundle, pinned to an expected
+    # version so every entry comes from a named committed revision.
+    session_id: NonEmptyId
+    expected_version: Annotated[int, Field(ge=0)]
+
+
+class SessionExportRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    # 1-8 sessions exported together; a duplicated id would make the bundle's
+    # source_id list ambiguous, so duplicates are rejected up front.
+    sessions: Annotated[list[SessionExportItem], Field(min_length=1, max_length=8)]
+
+    @model_validator(mode="after")
+    def validate_unique_session_ids(self) -> Self:
+        ids = [item.session_id for item in self.sessions]
+        if len(set(ids)) != len(ids):
+            raise ValueError("sessions must not contain duplicate session ids")
+        return self
+
+
+class BundleSession(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    # One exported session: everything an import needs to recreate the drill
+    # without touching the source database. The protocol reuses the full
+    # protocol validation; the trace ids are replayed from its initial
+    # configuration when the bundle is imported.
+    source_id: NonEmptyId
+    source_version: Annotated[int, Field(ge=0)]
+    protocol: DeadlockRequest
+    trace_ids: list[NonEmptyId]
+    locked: StrictBool
+
+
+class SessionBundle(BaseModel):
+    # The exported bundle; schema_version 1 is the only format version.
+    schema_version: int
+    sessions: list[BundleSession]
+
+
+class SessionBundleRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    # Import payload: the same shape as the exported bundle. StrictInt keeps
+    # "1", 1.0 and true from being coerced into the only supported version.
+    schema_version: StrictInt
+    sessions: Annotated[list[BundleSession], Field(min_length=1, max_length=8)]
+
+    @model_validator(mode="after")
+    def validate_unique_source_ids(self) -> Self:
+        ids = [entry.source_id for entry in self.sessions]
+        if len(set(ids)) != len(ids):
+            raise ValueError("sessions must not contain duplicate source_id values")
+        return self
+
+
+class ImportedSession(BaseModel):
+    # The old->new id mapping for one bundle entry plus the new session's
+    # recomputed snapshot.
+    source_id: str
+    session: SessionView
+
+
+class SessionImportResponse(BaseModel):
+    # One entry per bundle session, in the bundle's input order.
+    sessions: list[ImportedSession]

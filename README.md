@@ -574,7 +574,7 @@ curl -X POST http://localhost:8000/v1/deactivation-plans \
 
 ## 双端协议演练会话
 
-除上述四个离线分析接口外，服务还提供**有状态演练会话**：创建会话后可以逐个执行转移、随时查询当前配置与完整执行轨迹，也可以修改协议后从新初态重放已执行步骤，继续演练；还可以从指定轨迹位置另开**分支会话**，两边独立续演；另一会话中已走通的后续轨迹也可以直接**接回**目标会话，免去逐步重演。两次演练还可以按方向**对比消息交换**：只比较各自 `(action, message)` 序列，忽略转移 ID、端点状态与两方向之间的交错。还可以沿一次演练的完整轨迹**逐条追踪每个消息的发送与接收**：每次发送单列一条记录并与同方向后续的接收按一格队列先后配对，尚未被接收的发送三项接收信息为 `null`。会话还可以被**锁定为只读基准**：锁定后执行、替换协议与作为接回目标均被拒绝，查询、对比、分支与作为接回来源不受影响，解锁后按新版本继续演练。
+除上述四个离线分析接口外，服务还提供**有状态演练会话**：创建会话后可以逐个执行转移、随时查询当前配置与完整执行轨迹，也可以修改协议后从新初态重放已执行步骤，继续演练；还可以从指定轨迹位置另开**分支会话**，两边独立续演；另一会话中已走通的后续轨迹也可以直接**接回**目标会话，免去逐步重演。两次演练还可以按方向**对比消息交换**：只比较各自 `(action, message)` 序列，忽略转移 ID、端点状态与两方向之间的交错。还可以沿一次演练的完整轨迹**逐条追踪每个消息的发送与接收**：每次发送单列一条记录并与同方向后续的接收按一格队列先后配对，尚未被接收的发送三项接收信息为 `null`。会话还可以被**锁定为只读基准**：锁定后执行、替换协议与作为接回目标均被拒绝，查询、对比、分支与作为接回来源不受影响，解锁后按新版本继续演练。还可以把 1～8 个会话**导出为一份 JSON 资料包**（含协议、轨迹 ID、版本与锁定标记），交给另一实例**导入续演**：导入不依赖源库，逐条重放校验全部通过后以全新会话 ID、版本 0 一起创建并保留锁定标记，任一条目不合格则整包拒绝、不留部分会话。
 
 - 会话（协议、轨迹 ID、版本、锁定标记）持久化在**本地 SQLite 数据库**中，所有进程共享同一文件：服务或容器重建后仍可按原会话 ID 查询并继续执行、替换协议，版本不会回退。
 - 服务默认以 **2 个 Uvicorn worker** 进程运行，启动时自动建库建表（无需迁移旧数据）；旧版数据库启动时自动补充锁定列，已有协议、轨迹与版本保持不变，旧会话默认未锁定。
@@ -596,6 +596,8 @@ curl -X POST http://localhost:8000/v1/deactivation-plans \
 | `POST` | `/v1/session-comparisons` | 按消息方向对比两次演练（只读、不改数据与版本），请求体 `{"left_session_id": ..., "right_session_id": ..., "left_expected_version": ..., "right_expected_version": ...}` |
 | `POST` | `/v1/sessions/{id}/message-tracks` | 沿轨迹逐条追踪消息发送/接收（只读），请求体 `{"expected_version": ...}` |
 | `POST` | `/v1/sessions/{id}/transition-feasibility` | 查询当前配置下全部转移的可执行性与**所有**阻塞原因（只读），请求体 `{"expected_version": ...}` |
+| `POST` | `/v1/session-exports` | 把 1～8 个会话导出为一份 JSON 资料包（只读），请求体 `{"sessions": [{"session_id": ..., "expected_version": ...}, ...]}` |
+| `POST` | `/v1/session-imports` | 导入资料包续演：全部条目合格才一起创建新会话（新 ID、版本 0），请求体即导出的资料包 |
 
 响应均为同一会话视图：
 
@@ -615,6 +617,8 @@ curl -X POST http://localhost:8000/v1/deactivation-plans \
 - `422`：请求体不合法（复用原协议校验，规则同下节）；锁定请求的 `locked` 不是布尔值；替换协议时还包括**重放失败**——从新协议初态按已执行 ID 重放时，任一步不可执行或在轨迹结束前到达完成配置，响应体 `detail.first_failed_step` 给出从 1 计的首个失败步；分支时还包括 `prefix_length` 非法（布尔值、非整数、负数或超过当前轨迹长度）；接回时还包括：目标与来源是同一会话（`same_session`）、两边协议字段值或列表顺序不同（`protocol_mismatch`）、目标轨迹 ID 序列不是来源轨迹的严格前缀（`trace_not_strict_prefix`）。
 
 对比接口为只读操作，状态码：成功 `200`；任一会话 ID 未知返回 `404`；左或右的期望版本过期返回 `409`，响应体在通用 `current_version` 之外以 `side`（`"left"`/`"right"`）与 `session_id` 指出过期侧（左侧优先判定）；请求体不合法返回 `422`。对比不修改任何会话、不消耗版本。
+
+导出接口为只读操作，状态码：成功 `200`；任一会话 ID 未知返回 `404`；任一条目期望版本过期返回 `409`，`detail` 以 `session_id` 与 `current_version` 指出过期条目（按输入顺序判定第一个）；请求体不合法（条目数不在 1～8、会话 ID 重复、缺少字段等）返回 `422`。导出只读取会话、不消耗版本。导入接口状态码：全部条目合格时成功 `201`；`schema_version` 不是 `1`、`source_id` 重复、协议非法、轨迹重放失败或请求体不合法均返回 `422`，重放失败的 `detail` 以 `entry_index`（从 1 计）与 `first_failed_step`（从 1 计）定位失败条目与失败步；导入不查询任何已有会话，因此没有 `404`/`409`，任何失败都不留部分会话、不覆盖已有会话。
 
 替换协议允许改变已有 ID 的转移定义（端点状态、消息、source/target 等），但重放时每一步都必须在新协议下可执行，且不能在轨迹结束前到达完成配置；重放成功后轨迹与当前配置全部按新协议重算。完成配置只禁止继续执行转移，不禁止替换协议。
 
@@ -1499,6 +1503,252 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST \
 
 替换协议后查询按**新定义**重放（例如把 `s1` 的消息由 `"m"` 改为 `"ZZ"`，再按新版本查询即得到 `actual: "ZZ"` 的消息不匹配与队列占用）；查询不写数据、不消耗版本。并发场景下（2 个 worker），查询与执行/替换协议同时进行时，每个查询要么返回指定版本的完整结果，要么返回 `409`，不会出现跨版本拼凑的原因列表。
 
+### 导出演练资料包：`POST /v1/session-exports`
+
+把 1～8 个演练会话导出为一份**自包含 JSON 资料包**，供另一实例（另一个数据库）导入续演：
+
+- 请求体 `{"sessions": [{"session_id": ..., "expected_version": ...}, ...]}`：1～8 组会话 ID 与各自的期望版本；**会话 ID 不得重复**，重复（或条目数不在 1～8、字段缺失/多余）返回 `422`。
+- 所有会话行在**同一个读事务**内读取：WAL 模式下整个事务只观察同一份已提交快照，因此整包必然来自同一已提交状态，不会混入随后提交的修改。任一条目版本过期返回 `409`，`detail` 指出该条目的 `session_id` 与 `current_version`（按输入顺序判定第一个过期项）；未知会话返回 `404`。
+- 成功返回 `200` 与资料包：`schema_version` 固定为 `1`；`sessions` 按**输入顺序**逐项给出 `source_id`、`source_version`、`protocol`、`trace_ids`、`locked`，即源会话该版本的完整内容。导出**不修改源数据**：只读、不消耗版本，锁定会话同样可导出。
+
+#### 可执行示例：导出两个会话（端口 8000）
+
+先准备两个会话：会话一只执行 `t1`（`version` 为 `1`）；会话二走通 `t1, t4` 后锁定为只读基准（`version` 为 `3`）：
+
+```bash
+PROTO='{
+  "A": { "states": [0, 1], "initial": 0, "finals": [1] },
+  "B": { "states": [0, 1], "initial": 0, "finals": [1] },
+  "transitions": [
+    { "id": "t1", "from": "A", "to": "B", "action": "send",    "message": "m", "source": 0, "target": 1 },
+    { "id": "t4", "from": "A", "to": "B", "action": "receive", "message": "m", "source": 0, "target": 1 }
+  ]
+}'
+mk() { curl -s -X POST http://localhost:8000/v1/sessions -H 'Content-Type: application/json' -d "$PROTO" \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])'; }
+ex() { curl -s -o /dev/null -X POST http://localhost:8000/v1/sessions/$1/transitions \
+  -H 'Content-Type: application/json' -d "{\"transition_id\":\"$2\",\"expected_version\":$3}"; }
+
+S1=$(mk); ex $S1 t1 0
+S2=$(mk); ex $S2 t1 0; ex $S2 t4 1
+curl -s -o /dev/null -X PUT http://localhost:8000/v1/sessions/$S2/lock \
+  -H 'Content-Type: application/json' -d '{"expected_version":2,"locked":true}'
+echo "S1=$S1 S2=$S2"
+```
+
+导出（条目顺序即请求顺序，资料包存入 `bundle.json`）：
+
+```bash
+curl -s -X POST http://localhost:8000/v1/session-exports \
+  -H 'Content-Type: application/json' \
+  -d "{\"sessions\":[{\"session_id\":\"$S1\",\"expected_version\":1},{\"session_id\":\"$S2\",\"expected_version\":3}]}" \
+  | tee bundle.json | python3 -m json.tool
+```
+
+响应（节选）：`schema_version` 为 `1`，两个条目按输入顺序携带各自版本的协议、轨迹 ID 与锁定标记——
+
+```json
+{
+  "schema_version": 1,
+  "sessions": [
+    {
+      "source_id": "…S1…",
+      "source_version": 1,
+      "protocol": { "A": { "…": "…" }, "B": { "…": "…" }, "transitions": [ "…" ] },
+      "trace_ids": ["t1"],
+      "locked": false
+    },
+    {
+      "source_id": "…S2…",
+      "source_version": 3,
+      "protocol": { "…": "…" },
+      "trace_ids": ["t1", "t4"],
+      "locked": true
+    }
+  ]
+}
+```
+
+导出错误：未知会话 `404`；期望版本过期 `409` 并指出 `session_id` 与 `current_version`；ID 重复 `422`：
+
+```bash
+curl -s -i -X POST http://localhost:8000/v1/session-exports \
+  -H 'Content-Type: application/json' \
+  -d '{"sessions":[{"session_id":"does-not-exist","expected_version":0}]}'
+# HTTP/1.1 404 Not Found  ->  {"detail":"unknown session"}
+
+curl -s -i -X POST http://localhost:8000/v1/session-exports \
+  -H 'Content-Type: application/json' \
+  -d "{\"sessions\":[{\"session_id\":\"$S1\",\"expected_version\":0}]}"
+# HTTP/1.1 409 Conflict
+# {"detail":{"error":"version_conflict","current_version":1,"session_id":"…S1…"}}
+
+curl -s -i -X POST http://localhost:8000/v1/session-exports \
+  -H 'Content-Type: application/json' \
+  -d "{\"sessions\":[{\"session_id\":\"$S1\",\"expected_version\":1},{\"session_id\":\"$S1\",\"expected_version\":1}]}"
+# HTTP/1.1 422 Unprocessable Entity
+```
+
+导出后源会话保持原样（可用 `GET /v1/sessions/$S1` 复核版本与轨迹均未变）。
+
+### 导入资料包续演：`POST /v1/session-imports`
+
+把资料包导入**另一个实例**（另一个数据库）继续演练。导入只读取资料包本身，**不依赖源库**：
+
+- 请求体即导出的资料包。`schema_version` 必须为 `1`，其他格式版本（含字符串、布尔等形似值）一律 `422`；各条目 `source_id` 不得重复，重复返回 `422`；条目数同样为 1～8。
+- 每个条目按**现有协议校验**与**一格队列**规则，从其协议初态重放 `trace_ids`：转移 ID 必须存在、每步必须可执行，且**完成后不得有后续步**（到达完成配置后轨迹必须恰好结束）。任一不满足即**整包拒绝**，返回 `422`，`detail` 以 `entry_index`（从 1 计的条目）与 `first_failed_step`（从 1 计的失败步）定位：
+
+```json
+{ "detail": { "error": "replay_failed", "entry_index": 2, "first_failed_step": 2, "reason": "unknown transition id 't9'" } }
+```
+
+- **全部条目合格才一起创建**：所有新会话在同一个 `BEGIN IMMEDIATE` 事务内持久化，各自获得**全新会话 ID**、版本 `0`，`locked` 标记按资料包保留；当前配置、轨迹与可执行转移由协议与轨迹 ID **重算**（不复制源快照文本之外的任何状态）。
+- 成功返回 `201`，`sessions` 按输入顺序逐项给出旧新 ID 映射（`source_id` 与新会话 `id`）及新会话的完整快照。
+- 任何失败都**不留部分会话**，也**不覆盖任何已有会话**（一律使用全新 ID）；同一资料包可重复导入，每次得到一组互不相同的新会话。导入不查询已有会话，因此没有 `404`/`409`。
+
+#### 可执行示例：异库导入续演
+
+另起一个**使用独立数据库**的实例（同一镜像、另一个命名卷，主机端口 8001；Compose 服务与 8000 端口保持不变）：
+
+```bash
+docker build -t deadlock-api .
+docker run -d --name drill-target -p 8001:8000 -v drill-target-data:/data deadlock-api
+```
+
+（不用 Docker 时等价地：`SESSIONS_DB=/tmp/target.db uvicorn app.main:app --port 8001 --workers 2`。）
+
+把上一节导出的 `bundle.json` 导入该实例：
+
+```bash
+curl -s -X POST http://localhost:8001/v1/session-imports \
+  -H 'Content-Type: application/json' -d @bundle.json | tee import.json | python3 -m json.tool
+```
+
+返回 `201`，`sessions` 按输入顺序给出旧新 ID 映射与重算后的完整快照（新 ID、版本 `0`、锁定标记保留）：
+
+```json
+{
+  "sessions": [
+    {
+      "source_id": "…S1…",
+      "session": {
+        "id": "…新ID1…",
+        "version": 0,
+        "locked": false,
+        "configuration": { "state": { "A": 1, "B": 0 }, "queues": { "A_to_B": "m", "B_to_A": null } },
+        "trace": [ { "index": 1, "transition_id": "t1", "…": "…" } ],
+        "enabled_transition_ids": ["t4"]
+      }
+    },
+    {
+      "source_id": "…S2…",
+      "session": {
+        "id": "…新ID2…",
+        "version": 0,
+        "locked": true,
+        "configuration": { "state": { "A": 1, "B": 1 }, "queues": { "A_to_B": null, "B_to_A": null } },
+        "trace": [ { "…": "…" }, { "…": "…" } ],
+        "enabled_transition_ids": []
+      }
+    }
+  ]
+}
+```
+
+新会话是普通会话，直接用版本 `0` 在**目标实例**上续演（第一个会话继续执行 `t4` 至完成）：
+
+```bash
+N1=$(python3 -c 'import json;print(json.load(open("import.json"))["sessions"][0]["session"]["id"])')
+N2=$(python3 -c 'import json;print(json.load(open("import.json"))["sessions"][1]["session"]["id"])')
+
+curl -s -X POST http://localhost:8001/v1/sessions/$N1/transitions \
+  -H 'Content-Type: application/json' \
+  -d '{"transition_id": "t4", "expected_version": 0}'
+# 200：version 变为 1，轨迹 [t1, t4]，到达完成配置
+```
+
+第二个会话带着锁定标记导入，锁定期间执行被拒绝（`409 session_locked`），解锁后可继续：
+
+```bash
+curl -s -i -X POST http://localhost:8001/v1/sessions/$N2/transitions \
+  -H 'Content-Type: application/json' \
+  -d '{"transition_id": "t1", "expected_version": 0}'
+# HTTP/1.1 409 Conflict  ->  {"detail":{"error":"session_locked","session_id":"…新ID2…"}}
+
+curl -s -X PUT http://localhost:8001/v1/sessions/$N2/lock \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_version": 0, "locked": false}'
+```
+
+源实例（8000）上的两个会话全程不变（版本仍分别为 `1` 与 `3`）；目标实例不需要也访问不到源库。同一资料包再次导入会得到另一组全新 ID，已导入的会话不被覆盖：
+
+```bash
+curl -s http://localhost:8000/v1/sessions/$S1 | python3 -c 'import sys,json;b=json.load(sys.stdin);print(b["version"],[s["transition_id"] for s in b["trace"]])'
+# 1 ['t1']
+
+curl -s -X POST http://localhost:8001/v1/session-imports \
+  -H 'Content-Type: application/json' -d @bundle.json \
+  | python3 -c 'import sys,json;print([c["session"]["id"] for c in json.load(sys.stdin)["sessions"]])'
+# 另一组与 $N1、$N2 不同的新 ID
+```
+
+#### 可执行示例：整包拒绝（不留部分会话）
+
+格式版本不是 `1`：
+
+```bash
+python3 - << 'PY' > bad-version.json
+import json
+b = json.load(open("bundle.json")); b["schema_version"] = 2
+print(json.dumps(b))
+PY
+curl -s -i -X POST http://localhost:8001/v1/session-imports \
+  -H 'Content-Type: application/json' -d @bad-version.json
+# HTTP/1.1 422 Unprocessable Entity
+# {"detail":{"error":"unsupported_schema_version","schema_version":2}}
+```
+
+`source_id` 重复：
+
+```bash
+python3 - << 'PY' > bad-dup.json
+import json
+b = json.load(open("bundle.json"))
+b["sessions"] = [b["sessions"][0], b["sessions"][0]]
+print(json.dumps(b))
+PY
+curl -s -i -X POST http://localhost:8001/v1/session-imports \
+  -H 'Content-Type: application/json' -d @bad-dup.json
+# HTTP/1.1 422 Unprocessable Entity
+```
+
+某条轨迹重放失败（这里把第 2 条的轨迹改成含未知转移 `t9`；即使第 1 条完全合格也整包拒绝）：
+
+```bash
+python3 - << 'PY' > bad-trace.json
+import json
+b = json.load(open("bundle.json"))
+b["sessions"][1]["trace_ids"] = ["t1", "t9"]
+print(json.dumps(b))
+PY
+curl -s -i -X POST http://localhost:8001/v1/session-imports \
+  -H 'Content-Type: application/json' -d @bad-trace.json
+# HTTP/1.1 422 Unprocessable Entity
+# {"detail":{"error":"replay_failed","entry_index":2,"first_failed_step":2,
+#            "reason":"unknown transition id 't9'"}}
+```
+
+同样地，轨迹中途提前到达完成配置（如 `"trace_ids": ["t1", "t4", "t1"]`，第 3 步前已完成）也会以 `422` 整包拒绝，`reason` 为 `"configuration already completed"`。
+
+上述任何失败都不会留下部分会话：修正资料包后重新导入即正常成功，且新 ID 与此前任何一组都不同；目标实例里已存在的会话（包括此前成功导入的）一律不被改动：
+
+```bash
+curl -s -X POST http://localhost:8001/v1/session-imports \
+  -H 'Content-Type: application/json' -d @bundle.json \
+  | python3 -c 'import sys,json;print([c["session"]["id"] for c in json.load(sys.stdin)["sessions"]])'
+# 201：又一组全新 ID
+```
+
 ### 存储位置与卷保留规则
 
 - 数据库文件：容器内 **`/data/sessions.db`**（WAL 模式，运行时可能伴随 `-wal` / `-shm` 文件），可用环境变量 `SESSIONS_DB` 覆盖；本地开发缺省为工作目录下的 `./sessions.db`。
@@ -1583,6 +1833,7 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ├── docker-compose.yml
 ├── README.md
 ├── requirements.txt
+├── test_bundle.py
 ├── test_comparison.py
 ├── test_lock.py
 ├── test_message_tracks.py
